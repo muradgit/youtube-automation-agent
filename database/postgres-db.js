@@ -120,7 +120,7 @@ function createPostgresDatabaseClass(SQLiteDatabase) {
         .replace(/datetime\(\s*'now'\s*\)/gi, 'CURRENT_TIMESTAMP')
         .replace(/datetime\(\s*\?\s*\)/gi, 'CAST(? AS TIMESTAMPTZ)')
         .replace(/date\(\s*'now'\s*\)/gi, 'CURRENT_DATE')
-        .replace(/strftime\(\s*'%Y-%m-%d'\s*,\s*([^\)]+)\)/gi, "to_char($1, 'YYYY-MM-DD')")
+        .replace(/strftime\(\s*'%Y-%m-%d'\s*,\s*([^)]+)\)/gi, "to_char($1, 'YYYY-MM-DD')")
         .replace(/\bLIKE\s+\?\s+COLLATE\s+NOCASE\b/gi, 'ILIKE ?')
         .replace(/\bdf\.rowid\b/gi, 'df.id')
         .replace(/\browid\b/gi, 'id')
