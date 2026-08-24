@@ -8,7 +8,62 @@ function installPostgresAdapter() {
   const databasePath = require.resolve('../database/db');
   const databaseModule = require(databasePath);
   const { createPostgresDatabaseClass } = require('../database/postgres-db');
-  databaseModule.Database = createPostgresDatabaseClass(databaseModule.Database);
+  const PostgresDatabase = createPostgresDatabaseClass(databaseModule.Database);
+
+  // A web-function cold start must never mark jobs owned by a durable worker as
+  // interrupted. The worker remains the authority for job lifecycle recovery.
+  PostgresDatabase.prototype.markInterruptedJobs = async function skipWebRecovery() {
+    this.logger.info('Skipping interrupted-job recovery in Vercel web runtime');
+  };
+
+  databaseModule.Database = PostgresDatabase;
+}
+
+function installEnvironmentCredentials() {
+  const { CredentialManager } = require('../utils/credential-manager');
+  const originalLoadCredentials = CredentialManager.prototype.loadCredentials;
+  const originalLoadTokens = CredentialManager.prototype.loadTokens;
+
+  CredentialManager.prototype.loadCredentials = async function loadVercelCredentials() {
+    await originalLoadCredentials.call(this);
+
+    if (process.env.YOUTUBE_CLIENT_ID && process.env.YOUTUBE_CLIENT_SECRET) {
+      this.credentials.youtube = {
+        ...(this.credentials.youtube || {}),
+        client_id: process.env.YOUTUBE_CLIENT_ID,
+        client_secret: process.env.YOUTUBE_CLIENT_SECRET,
+        redirect_uris: [process.env.YOUTUBE_REDIRECT_URI || 'http://localhost:8080/oauth2callback']
+      };
+    }
+  };
+
+  CredentialManager.prototype.loadTokens = async function loadVercelTokens() {
+    await originalLoadTokens.call(this);
+
+    if (process.env.YOUTUBE_REFRESH_TOKEN) {
+      const defaultScopes = [
+        'https://www.googleapis.com/auth/youtube.upload',
+        'https://www.googleapis.com/auth/youtube',
+        'https://www.googleapis.com/auth/youtube.readonly',
+        'https://www.googleapis.com/auth/yt-analytics.readonly',
+        'https://www.googleapis.com/auth/youtube.force-ssl'
+      ].join(' ');
+
+      this.tokens.youtube = {
+        ...(this.tokens.youtube || {}),
+        refresh_token: process.env.YOUTUBE_REFRESH_TOKEN,
+        token_type: 'Bearer',
+        scope: process.env.YOUTUBE_TOKEN_SCOPE || defaultScopes
+      };
+
+      if (process.env.YOUTUBE_ACCESS_TOKEN) {
+        this.tokens.youtube.access_token = process.env.YOUTUBE_ACCESS_TOKEN;
+      }
+      if (process.env.YOUTUBE_TOKEN_EXPIRY_DATE) {
+        this.tokens.youtube.expiry_date = Number(process.env.YOUTUBE_TOKEN_EXPIRY_DATE);
+      }
+    }
+  };
 }
 
 function installServerlessPatches() {
@@ -59,6 +114,7 @@ function protectHeavyWorkerMethods(agent) {
 
 async function createAgent() {
   installPostgresAdapter();
+  installEnvironmentCredentials();
   installServerlessPatches();
 
   const { YouTubeAutomationAgent } = require('../index');
