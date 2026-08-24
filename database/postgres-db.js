@@ -1,4 +1,14 @@
 const { Pool } = require('pg');
+const { AsyncLocalStorage } = require('node:async_hooks');
+
+const TIMESTAMP_COLUMNS = [
+  'scheduled_publish_time', 'publish_time', 'published_at', 'analyzed_at',
+  'measured_at', 'created_at', 'updated_at', 'reviewed_at', 'approved_at',
+  'started_at', 'completed_at', 'adopted_at', 'cancelled_at', 'ended_at',
+  'captured_at', 'updated_at_youtube', 'posted_at', 'last_synced_at',
+  'newest_comment_at', 'narration_generated_at', 'rendered_at', 'publish_date',
+  'last_used', 'scheduled_for'
+];
 
 /**
  * Build a Postgres-backed Database class while preserving the existing SQLite
@@ -13,6 +23,7 @@ function createPostgresDatabaseClass(SQLiteDatabase) {
       this.db = null;
       this.isPostgres = true;
       this.constraintCache = new Map();
+      this.transactionStorage = new AsyncLocalStorage();
     }
 
     async initialize() {
@@ -41,6 +52,33 @@ function createPostgresDatabaseClass(SQLiteDatabase) {
       return !/localhost|127\.0\.0\.1/.test(process.env.DATABASE_URL || '');
     }
 
+    queryClient() {
+      return this.transactionStorage.getStore() || this.pool;
+    }
+
+    async withTransaction(work) {
+      const client = await this.pool.connect();
+      try {
+        await client.query('BEGIN');
+        const result = await this.transactionStorage.run(client, work);
+        await client.query('COMMIT');
+        return result;
+      } catch (error) {
+        try {
+          await client.query('ROLLBACK');
+        } catch (rollbackError) {
+          this.logger.error(`Postgres rollback failed: ${rollbackError.message}`);
+        }
+        throw error;
+      } finally {
+        client.release();
+      }
+    }
+
+    async saveDiscoverabilityAudit(...args) {
+      return this.withTransaction(() => SQLiteDatabase.prototype.saveDiscoverabilityAudit.apply(this, args));
+    }
+
     async ensureColumns(tableName, columns) {
       const allowedTables = new Set(['production_scenes', 'channel_strategies', 'discoverability_audits']);
       if (!allowedTables.has(tableName)) throw new Error(`Unsupported migration table: ${tableName}`);
@@ -55,7 +93,8 @@ function createPostgresDatabaseClass(SQLiteDatabase) {
 
       for (const [columnName, definition] of Object.entries(columns)) {
         if (!existing.has(columnName)) {
-          await this.pool.query(`ALTER TABLE ${this.quoteIdentifier(tableName)} ADD COLUMN ${this.quoteIdentifier(columnName)} ${definition}`);
+          const normalized = columnName === 'narration_generated_at' ? 'TIMESTAMPTZ' : definition;
+          await this.pool.query(`ALTER TABLE ${this.quoteIdentifier(tableName)} ADD COLUMN ${this.quoteIdentifier(columnName)} ${normalized}`);
         }
       }
     }
@@ -64,14 +103,28 @@ function createPostgresDatabaseClass(SQLiteDatabase) {
       return `"${String(value).replace(/"/g, '""')}"`;
     }
 
+    normalizeCreateTable(sql) {
+      if (!/^CREATE\s+TABLE\b/i.test(sql)) return sql;
+      let output = sql.replace(/INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT/gi, 'BIGSERIAL PRIMARY KEY');
+      for (const column of TIMESTAMP_COLUMNS) {
+        const matcher = new RegExp(`\\b${column}\\s+TEXT\\b`, 'gi');
+        output = output.replace(matcher, `${column} TIMESTAMPTZ`);
+      }
+      return output;
+    }
+
     normalizeSqliteDateFunctions(sql) {
       return sql
         .replace(/datetime\(\s*'now'\s*,\s*'-(\d+)\s+days?'\s*\)/gi, "CURRENT_TIMESTAMP - INTERVAL '$1 days'")
         .replace(/datetime\(\s*'now'\s*,\s*'-(\d+)\s+hours?'\s*\)/gi, "CURRENT_TIMESTAMP - INTERVAL '$1 hours'")
         .replace(/datetime\(\s*'now'\s*\)/gi, 'CURRENT_TIMESTAMP')
+        .replace(/datetime\(\s*\?\s*\)/gi, 'CAST(? AS TIMESTAMPTZ)')
         .replace(/date\(\s*'now'\s*\)/gi, 'CURRENT_DATE')
         .replace(/strftime\(\s*'%Y-%m-%d'\s*,\s*([^\)]+)\)/gi, "to_char($1, 'YYYY-MM-DD')")
-        .replace(/\bLIKE\s+\?\s+COLLATE\s+NOCASE\b/gi, 'ILIKE ?');
+        .replace(/\bLIKE\s+\?\s+COLLATE\s+NOCASE\b/gi, 'ILIKE ?')
+        .replace(/\bdf\.rowid\b/gi, 'df.id')
+        .replace(/\browid\b/gi, 'id')
+        .replace(/\bstatus\s*=\s*"published"/gi, "status = 'published'");
     }
 
     convertPlaceholders(sql) {
@@ -138,9 +191,10 @@ function createPostgresDatabaseClass(SQLiteDatabase) {
     }
 
     async prepareQuery(query, params = []) {
-      let sql = this.normalizeSqliteDateFunctions(String(query).trim());
+      let sql = String(query).trim();
+      sql = this.normalizeCreateTable(sql);
+      sql = this.normalizeSqliteDateFunctions(sql);
       sql = sql.replace(/\bIS\s+\?/gi, 'IS NOT DISTINCT FROM ?');
-      sql = sql.replace(/INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT/gi, 'BIGSERIAL PRIMARY KEY');
 
       const isIgnore = /^INSERT\s+OR\s+IGNORE\s+/i.test(sql);
       const isReplace = /^INSERT\s+OR\s+REPLACE\s+/i.test(sql);
@@ -177,9 +231,15 @@ function createPostgresDatabaseClass(SQLiteDatabase) {
     }
 
     async executeQuery(query, params = []) {
+      const raw = String(query).trim();
+      const inManagedTransaction = Boolean(this.transactionStorage.getStore());
+      if (inManagedTransaction && /^(BEGIN(?:\s+TRANSACTION)?|COMMIT|ROLLBACK)\s*;?$/i.test(raw)) {
+        return { lastID: null, changes: 0, rowCount: 0 };
+      }
+
       const prepared = await this.prepareQuery(query, params);
       try {
-        const result = await this.pool.query(prepared.text, prepared.values);
+        const result = await this.queryClient().query(prepared.text, prepared.values);
         return {
           lastID: result.rows?.[0]?.id || null,
           changes: result.rowCount,
@@ -194,13 +254,13 @@ function createPostgresDatabaseClass(SQLiteDatabase) {
 
     async getRow(query, params = []) {
       const prepared = await this.prepareQuery(query, params);
-      const result = await this.pool.query(prepared.text, prepared.values);
+      const result = await this.queryClient().query(prepared.text, prepared.values);
       return result.rows[0] || null;
     }
 
     async getAllRows(query, params = []) {
       const prepared = await this.prepareQuery(query, params);
-      const result = await this.pool.query(prepared.text, prepared.values);
+      const result = await this.queryClient().query(prepared.text, prepared.values);
       return result.rows;
     }
 
@@ -211,7 +271,8 @@ function createPostgresDatabaseClass(SQLiteDatabase) {
 
     async getDatabaseSize() {
       const result = await this.pool.query('SELECT pg_database_size(current_database()) AS bytes');
-      return Number(result.rows[0]?.bytes || 0);
+      const bytes = Number(result.rows[0]?.bytes || 0);
+      return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
     }
 
     async close() {
